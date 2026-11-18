@@ -1,6 +1,6 @@
 # Lab: Crypto Server Client
 
-A Python client for the course crypto server. It encrypts files locally with AES-256-GCM, has the server decrypt them, and computes the course HMAC for the server to verify. Messages follow `crypto_message_spec_v2.md`.
+A Python client connecting to AWS cloud server. It encrypts files locally with AES-256-GCM key, ask the server to decrypt them, and computes the course HMAC for the server to verify. Messages follow `crypto_message_spec_v2.md`.
 
 **Result:** all tests passed against the real server. Decryption returned the original files, the server answered VERIFIED for a correct HMAC, and it answered FAILED after one byte of the file was changed.
 

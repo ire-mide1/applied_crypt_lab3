@@ -1,15 +1,20 @@
-# Crypto server client. So far: constants, exceptions, framing, AES-GCM,
-# course HMAC, base64/key helpers, the three network requests, file-name
-# helpers, file reading/writing and the op_* wrappers. No GUI yet.
+# Crypto server client: constants, exceptions, framing, AES-GCM, course HMAC,
+# base64/key helpers, the three network requests, file-name helpers, file
+# reading/writing, the op_* wrappers and the Tkinter GUI.
+# Run the GUI with: python crypto_client/client.py
 
 import base64
 import binascii
 import json
 import os
+import queue
 import re
 import socket
 import struct
+import threading
+import tkinter as tk
 from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -390,12 +395,18 @@ def op_encrypt(src, key, enc_out):
     return enc_out, key_path
 
 
-def op_decrypt(host, port, username, enc_path, key):
-    """Checks the .enc file locally, sends it to the server, returns plaintext."""
+def check_enc_file(enc_path):
+    """Local checks for a file to decrypt: .enc name, 28 bytes to 1 MiB."""
     path = require_enc(enc_path)
     size = check_size(path, MAX_PAYLOAD, "Encrypted file")
     if size < MIN_ENC_SIZE:
         raise ClientError("Not a valid encrypted file (too short)")
+    return path
+
+
+def op_decrypt(host, port, username, enc_path, key):
+    """Checks the .enc file locally, sends it to the server, returns plaintext."""
+    path = check_enc_file(enc_path)
     return request_decrypt(host, port, username, key, _read_bytes(path))
 
 
@@ -423,3 +434,340 @@ def op_verify(host, port, username, path, key, mac):
     """Checks the file locally, sends it to the server. True = VERIFIED."""
     data = read_input_file(path, MAX_PAYLOAD, "File")
     return request_verify(host, port, username, key, mac, data)
+
+
+# ------------------------------------------------------------------------ GUI
+class Cancelled(Exception):
+    """The user closed a dialog or answered No. Not an error."""
+
+
+def validate_connection(host, port_text, username):
+    """Check the connection fields locally. Returns (host, port, username)."""
+    if not host:
+        raise ClientError("Enter the server host or IP address.")
+    if not (port_text.isdigit() and 1 <= int(port_text) <= 65535):
+        raise ClientError("The port must be a whole number from 1 to 65535.")
+    if not USERNAME_RE.fullmatch(username):
+        raise ClientError("The username must be 1-32 characters from A-Z a-z 0-9 _ . -")
+    return host, int(port_text), username
+
+
+ALL_FILES = ("All files", "*.*")
+OPERATIONS = ["Get AES Key", "Encrypt", "Decrypt", "Get HMAC Key", "Compute HMAC", "Verify HMAC"]
+# For each operation: a hint, and its file fields as (key, label, file types).
+PANELS = {
+    "Get AES Key": ("Gets a new AES key from the server and keeps it in memory.", []),
+    "Encrypt": ("Encrypts a file locally with the AES key. Run asks where to save it.",
+                [("src", "File to encrypt:", [ALL_FILES])]),
+    "Decrypt": ("Sends an encrypted file and its key to the server. The key file is found "
+                "automatically if it sits beside the .enc file. Run asks for the output folder.",
+                [("enc", "Encrypted file (.enc):", [("Encrypted files", "*.enc"), ALL_FILES]),
+                 ("key", "Key file (.key):", [("Key files", "*.key"), ALL_FILES])]),
+    "Get HMAC Key": ("Gets a new key from the server and keeps it in memory as the HMAC key.", []),
+    "Compute HMAC": ("Computes the HMAC of a file locally with the HMAC key.",
+                     [("src", "File:", [ALL_FILES])]),
+    "Verify HMAC": ("Sends a file, its key and its HMAC to the server. The .hmac and .hmackey "
+                    "files are found automatically if they sit beside the file.",
+                    [("src", "File:", [ALL_FILES]),
+                     ("hmac", "HMAC file (.hmac):", [("HMAC files", "*.hmac"), ALL_FILES]),
+                     ("hmackey", "HMAC key file (.hmackey):",
+                      [("HMAC key files", "*.hmackey"), ALL_FILES])]),
+}
+STATUS_COLOURS = {"verified": "#008000", "failed": "#cc0000", "error": "black", "info": "black"}
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.aes_key = None            # two separate key slots, kept in memory only
+        self.hmac_key = None
+        self.busy = False
+        self.results = queue.Queue()   # worker thread -> main thread
+        self.handlers = {
+            "Get AES Key": lambda: self.do_get_key("aes"),
+            "Encrypt": self.do_encrypt,
+            "Decrypt": self.do_decrypt,
+            "Get HMAC Key": lambda: self.do_get_key("hmac"),
+            "Compute HMAC": self.do_compute_hmac,
+            "Verify HMAC": self.do_verify,
+        }
+        root.title("Crypto Server Client")
+        root.minsize(640, 260)
+
+        # connection bar and operation dropdown
+        bar = tk.Frame(root)
+        bar.pack(fill="x", padx=8, pady=(8, 2))
+        self.host = tk.StringVar()
+        self.port = tk.StringVar(value=str(DEFAULT_PORT))
+        self.user = tk.StringVar()
+        tk.Label(bar, text="Host/IP:").grid(row=0, column=0, sticky="e")
+        tk.Entry(bar, textvariable=self.host, width=24).grid(row=0, column=1, padx=(2, 10))
+        tk.Label(bar, text="Port:").grid(row=0, column=2, sticky="e")
+        tk.Entry(bar, textvariable=self.port, width=7).grid(row=0, column=3, padx=(2, 10))
+        tk.Label(bar, text="Username:").grid(row=0, column=4, sticky="e")
+        tk.Entry(bar, textvariable=self.user, width=18).grid(row=0, column=5, padx=2)
+        self.operation = tk.StringVar(value=OPERATIONS[0])
+        tk.Label(bar, text="Operation:").grid(row=1, column=0, sticky="e", pady=(8, 0))
+        combo = ttk.Combobox(bar, textvariable=self.operation, values=OPERATIONS,
+                             state="readonly", width=22)
+        combo.grid(row=1, column=1, columnspan=2, sticky="w", padx=(2, 10), pady=(8, 0))
+        combo.bind("<<ComboboxSelected>>", lambda event: self.on_operation_change())
+
+        # one panel per operation; only the selected one is shown
+        self.op_area = tk.Frame(root)
+        self.op_area.pack(fill="x", padx=8, pady=8)
+        self.panels = {}
+        self.vars = {}
+        self.run_buttons = []
+        for op in OPERATIONS:
+            self.panels[op] = self.build_panel(op)
+        self.current = None
+        self.on_operation_change()
+
+        # status line
+        self.status = tk.Label(root, text="", anchor="w", justify="left", wraplength=620)
+        self.status.pack(fill="x", side="bottom", padx=8, pady=8)
+
+        self.root.after(100, self.poll_queue)
+
+    def build_panel(self, op):
+        hint, fields = PANELS[op]
+        panel = tk.Frame(self.op_area)
+        tk.Label(panel, text=hint, anchor="w", justify="left",
+                 wraplength=600).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        row = 1
+        for key, label, filetypes in fields:
+            var = tk.StringVar()
+            self.vars[(op, key)] = var
+            tk.Label(panel, text=label).grid(row=row, column=0, sticky="e")
+            tk.Entry(panel, textvariable=var, width=52).grid(row=row, column=1, padx=4, pady=2)
+            tk.Button(panel, text="Browse...",
+                      command=lambda o=op, k=key, t=filetypes, l=label: self.browse(o, k, t, l)
+                      ).grid(row=row, column=2)
+            row += 1
+        run = tk.Button(panel, text="Run", width=10, command=self.run_selected)
+        run.grid(row=row, column=1, sticky="w", padx=4, pady=(8, 0))
+        self.run_buttons.append(run)
+        return panel
+
+    def on_operation_change(self):
+        if self.current is not None:
+            self.panels[self.current].pack_forget()
+        self.current = self.operation.get()
+        self.panels[self.current].pack(fill="x")
+
+    # --- status, busy state, errors
+    def set_status(self, text, kind="info"):
+        if kind == "error":
+            text = "ERROR: " + text
+        self.status.config(text=text, fg=STATUS_COLOURS[kind])
+
+    def set_busy(self, busy):
+        self.busy = busy
+        for button in self.run_buttons:
+            button.config(state="disabled" if busy else "normal")
+
+    def handle_exception(self, exc):
+        """The one place that turns an exception into a status line. Never
+        shows raw exception text, so no key or request content can leak."""
+        if isinstance(exc, Cancelled):
+            self.set_status("Cancelled.", "info")
+        elif isinstance(exc, ServerError):
+            text = "Server returned an error"
+            if exc.detail:
+                text += " (%s)" % exc.detail
+            self.set_status(text, "error")
+        elif isinstance(exc, ClientError):
+            self.set_status(str(exc), "error")
+        else:
+            self.set_status("Unexpected internal error (%s)" % type(exc).__name__, "error")
+
+    # --- worker thread
+    def start_worker(self, func, args, on_done):
+        """Run func(*args) off the main thread. on_done(result) runs back on
+        the main thread. The worker never touches a widget."""
+        self.set_busy(True)
+        self.set_status("Contacting the server...", "info")
+
+        def work():
+            try:
+                self.results.put(("ok", func(*args), on_done))
+            except Exception as exc:
+                self.results.put(("err", exc, None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def poll_queue(self):
+        try:
+            while True:
+                state, value, on_done = self.results.get_nowait()
+                self.set_busy(False)
+                try:
+                    if state == "ok":
+                        on_done(value)
+                    else:
+                        self.handle_exception(value)
+                except Exception as exc:
+                    self.handle_exception(exc)
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll_queue)
+
+    # --- helpers for the handlers (main thread)
+    def run_selected(self):
+        if self.busy:
+            return
+        try:
+            self.handlers[self.operation.get()]()
+        except Exception as exc:
+            self.handle_exception(exc)
+
+    def connection(self):
+        return validate_connection(self.host.get().strip(), self.port.get().strip(),
+                                   self.user.get().strip())
+
+    def field_text(self, op, key):
+        return self.vars[(op, key)].get().strip().strip('"')
+
+    def path(self, op, key, message):
+        text = self.field_text(op, key)
+        if not text:
+            raise ClientError(message)
+        return Path(text)
+
+    def browse(self, op, key, filetypes, label):
+        chosen = filedialog.askopenfilename(title="Select " + label.rstrip(":"),
+                                            filetypes=filetypes)
+        if not chosen:
+            return
+        self.vars[(op, key)].set(chosen)
+        # fill in the companion files when they sit beside the chosen file
+        try:
+            if (op, key) == ("Decrypt", "enc"):
+                companions = {"key": key_path_for_enc(chosen)}
+            elif (op, key) == ("Verify HMAC", "src"):
+                companions = dict(zip(("hmac", "hmackey"), hmac_paths(chosen)))
+            else:
+                return
+        except ClientError:                      # not a .enc file: Run will say so
+            companions = {"key": None}
+        for name, companion in companions.items():
+            found = companion is not None and companion.is_file()
+            self.vars[(op, name)].set(str(companion) if found else "")
+
+    def resolve_file(self, op, key, derived, title):
+        """The file in the field, else the derived companion if it exists,
+        else a file picker."""
+        text = self.field_text(op, key)
+        if text:
+            return Path(text)
+        if derived.is_file():
+            return derived
+        chosen = filedialog.askopenfilename(title=title, initialdir=str(derived.parent))
+        if not chosen:
+            raise Cancelled()
+        return Path(chosen)
+
+    def confirm_replace(self, paths, note=""):
+        existing = [p for p in paths if p.exists()]
+        if not existing:
+            return
+        text = "These files already exist:\n" + "\n".join(p.name for p in existing)
+        text += "\n\nReplace them?" + (("\n\n" + note) if note else "")
+        if not messagebox.askyesno("Replace existing file?", text, icon="warning"):
+            raise Cancelled()
+
+    # --- operations
+    def do_get_key(self, slot):
+        host, port, user = self.connection()
+
+        def done(key):
+            if slot == "aes":
+                self.aes_key = key
+                self.set_status("AES key received", "info")
+            else:
+                self.hmac_key = key
+                self.set_status("HMAC key received", "info")
+
+        self.start_worker(request_get_key, (host, port, user), done)
+
+    def do_encrypt(self):
+        if self.aes_key is None:
+            raise ClientError("Get an AES key first.")
+        src = self.path("Encrypt", "src", "Choose a file to encrypt.")
+        check_size(src, MAX_PLAINTEXT, "File to encrypt")
+        chosen = filedialog.asksaveasfilename(
+            title="Save the encrypted file as", initialdir=str(src.parent),
+            initialfile=enc_path_for_original(src).name, defaultextension=ENC_SUFFIX,
+            filetypes=[("Encrypted files", "*.enc")])
+        if not chosen:
+            raise Cancelled()
+        enc_out = Path(chosen)
+        if not _is_enc_name(enc_out.name):       # force .enc
+            enc_out = enc_out.with_name(enc_out.name + ENC_SUFFIX)
+            self.confirm_replace([enc_out])      # the dialog did not ask about this name
+        self.confirm_replace(
+            [key_path_for_enc(enc_out)],
+            "Replacing a key file makes the .enc file that used it impossible to decrypt.")
+        enc_out, key_path = op_encrypt(src, self.aes_key, enc_out)
+        self.set_status("Encrypted. Wrote %s and %s." % (enc_out.name, key_path.name), "info")
+
+    def do_decrypt(self):
+        host, port, user = self.connection()
+        enc = check_enc_file(self.path("Decrypt", "enc", "Choose a .enc file to decrypt."))
+        key_file = self.resolve_file("Decrypt", "key", key_path_for_enc(enc),
+                                     "Select the key file")
+        key = read_b64_file(key_file)
+        folder = filedialog.askdirectory(title="Choose the folder for the decrypted file",
+                                         initialdir=str(enc.parent))
+        if not folder:
+            raise Cancelled()
+        out_path = decrypted_output_path(enc, folder)
+        self.confirm_replace([out_path])
+
+        def done(plaintext):
+            saved = write_decrypted(plaintext, enc, folder)
+            result, message = compare_with_original(enc, saved)
+            self.set_status("Saved %s. %s" % (saved.name, message),
+                            "error" if result is False else "info")
+
+        self.start_worker(op_decrypt, (host, port, user, enc, key), done)
+
+    def do_compute_hmac(self):
+        if self.hmac_key is None:
+            raise ClientError("Get an HMAC key first.")
+        src = self.path("Compute HMAC", "src", "Choose a file.")
+        check_size(src, MAX_PAYLOAD, "File")
+        self.confirm_replace(list(hmac_paths(src)))
+        _, hmac_path, hmackey_path = op_compute_hmac(src, self.hmac_key)
+        self.set_status("HMAC computed. Wrote %s and %s." % (hmac_path.name, hmackey_path.name),
+                        "info")
+
+    def do_verify(self):
+        host, port, user = self.connection()
+        src = self.path("Verify HMAC", "src", "Choose the file to verify.")
+        check_size(src, MAX_PAYLOAD, "File")
+        hmac_default, hmackey_default = hmac_paths(src)
+        hmac_file = self.resolve_file("Verify HMAC", "hmac", hmac_default, "Select the .hmac file")
+        hmackey_file = self.resolve_file("Verify HMAC", "hmackey", hmackey_default,
+                                         "Select the .hmackey file")
+        mac = read_b64_file(hmac_file)
+        key = read_b64_file(hmackey_file)
+
+        def done(verified):
+            if verified:
+                self.set_status("HMAC verified by server", "verified")
+            else:
+                self.set_status("HMAC did not match", "failed")
+
+        self.start_worker(op_verify, (host, port, user, src, key, mac), done)
+
+
+def main():
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

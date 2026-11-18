@@ -1,0 +1,6 @@
+﻿PASS  get_key returns a 32-byte key
+PASS  encrypt then server decrypt returns hello world
+PASS  verify_hmac section 9 vector gives VERIFIED
+PASS  verify_hmac with one changed byte gives FAILED
+
+All 4 steps passed.

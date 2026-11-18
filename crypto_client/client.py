@@ -1,6 +1,6 @@
 # Crypto server client. So far: constants, exceptions, framing, AES-GCM,
-# course HMAC, base64/key helpers and the three network requests.
-# No GUI and no file-name helpers yet.
+# course HMAC, base64/key helpers, the three network requests, file-name
+# helpers, file reading/writing and the op_* wrappers. No GUI yet.
 
 import base64
 import binascii
@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import struct
+from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -235,3 +236,190 @@ def request_verify(host, port, username, key, mac, data):
     if result == "FAILED":
         return False
     raise ClientError(UNEXPECTED_REPLY)
+
+
+# ---------------------------------------------------------------- file names
+ENC_SUFFIX = ".enc"
+
+
+def _is_enc_name(name):
+    return name.endswith(ENC_SUFFIX) and len(name) > len(ENC_SUFFIX)
+
+
+def require_enc(enc_path):
+    """Return enc_path as a Path, or refuse it if it is not a .enc file."""
+    path = Path(enc_path)
+    if not _is_enc_name(path.name):
+        raise ClientError("Please pick a .enc file.")
+    return path
+
+
+def enc_path_for_original(path):
+    """wave.wav -> wave.wav.enc (default name for the encrypted file)."""
+    path = Path(path)
+    return path.with_name(path.name + ENC_SUFFIX)
+
+
+def key_path_for_enc(enc_path):
+    """wave.wav.enc -> wave.wav.key (remove .enc, add .key)."""
+    path = require_enc(enc_path)
+    return path.with_name(path.name[:-len(ENC_SUFFIX)] + ".key")
+
+
+def original_path_for_enc(enc_path):
+    """wave.wav.enc -> wave.wav (remove .enc)."""
+    path = require_enc(enc_path)
+    return path.with_name(path.name[:-len(ENC_SUFFIX)])
+
+
+def dec_name_for_enc(enc_path):
+    """Name for the decrypted file: remove .enc, insert .dec before the last
+    extension only. A leading dot is not an extension.
+    wave.wav.enc -> wave.dec.wav, a.tar.gz.enc -> a.tar.dec.gz,
+    README.enc -> README.dec, .bashrc.enc -> .bashrc.dec
+    """
+    name = original_path_for_enc(enc_path).name
+    dot = name.rfind(".")
+    if dot <= 0:
+        return name + ".dec"
+    return name[:dot] + ".dec" + name[dot:]
+
+
+def decrypted_output_path(enc_path, out_dir):
+    """Where the decrypted file goes: the chosen folder plus the .dec name."""
+    return Path(out_dir) / dec_name_for_enc(enc_path)
+
+
+def hmac_paths(path):
+    """wave.wav -> (wave.wav.hmac, wave.wav.hmackey)."""
+    path = Path(path)
+    return path.with_name(path.name + ".hmac"), path.with_name(path.name + ".hmackey")
+
+
+# ------------------------------------------------------- file read and write
+def _os_message(action, path, exc):
+    return "%s %s: %s" % (action, Path(path).name, exc.strerror or type(exc).__name__)
+
+
+def check_size(path, limit, label):
+    """Refuse a file over `limit` bytes. Returns its size."""
+    try:
+        size = Path(path).stat().st_size
+    except OSError as exc:
+        raise ClientError(_os_message("Cannot read", path, exc)) from None
+    if size > limit:
+        raise ClientError("%s is larger than %s bytes." % (label, format(limit, ",")))
+    return size
+
+
+def _read_bytes(path):
+    try:
+        return Path(path).read_bytes()
+    except OSError as exc:
+        raise ClientError(_os_message("Cannot read", path, exc)) from None
+
+
+def _write_bytes(path, data):
+    try:
+        Path(path).write_bytes(data)
+    except OSError as exc:
+        raise ClientError(_os_message("Cannot write", path, exc)) from None
+
+
+def read_input_file(path, limit, label):
+    """Check the size first, then read the whole file."""
+    check_size(path, limit, label)
+    return _read_bytes(path)
+
+
+def write_b64_file(path, raw):
+    """Write raw bytes as standard base64 text with no trailing newline."""
+    _write_bytes(path, encode_b64(raw).encode("ascii"))
+
+
+def read_b64_file(path):
+    """Read a .key, .hmac or .hmackey file. Strips surrounding whitespace and
+    requires strict standard base64 that decodes to exactly 32 bytes."""
+    return decode_key_text(_read_bytes(path), "File " + Path(path).name)
+
+
+def files_identical(path_a, path_b):
+    """Byte-by-byte comparison, in chunks."""
+    if Path(path_a).stat().st_size != Path(path_b).stat().st_size:
+        return False
+    with open(path_a, "rb") as fa, open(path_b, "rb") as fb:
+        while True:
+            a, b = fa.read(65536), fb.read(65536)
+            if a != b:
+                return False
+            if not a:
+                return True
+
+
+def compare_with_original(enc_path, dec_path):
+    """Compare the decrypted file with the original next to the .enc file
+    (the .enc name with .enc removed). Returns (result, message): result is
+    True (match), False (no match) or None (original not found)."""
+    original = original_path_for_enc(enc_path)
+    if not original.is_file():
+        return None, "Original not found next to the .enc file, comparison skipped."
+    try:
+        same = files_identical(original, dec_path)
+    except OSError as exc:
+        raise ClientError(_os_message("Cannot read", exc.filename or original, exc)) from None
+    if same:
+        return True, "Decrypted file matches the original byte for byte."
+    return False, "Decrypted file does NOT match the original."
+
+
+# ----------------------------------------------------------------- operations
+# Overwrite questions belong to the GUI: these functions write what they are
+# given. Keys and HMACs come in as raw bytes, already read and validated.
+def op_encrypt(src, key, enc_out):
+    """Encrypt src to enc_out and write the key beside it as <name>.key.
+    Returns (enc path, key path)."""
+    enc_out = Path(enc_out)
+    if not _is_enc_name(enc_out.name):
+        raise ClientError("The output file name must end in .enc.")
+    if len(key) != KEY_LEN:
+        raise ValueError("key must be 32 bytes")
+    data = read_input_file(src, MAX_PLAINTEXT, "File to encrypt")
+    _write_bytes(enc_out, encrypt_bytes(key, data))
+    key_path = key_path_for_enc(enc_out)
+    write_b64_file(key_path, key)
+    return enc_out, key_path
+
+
+def op_decrypt(host, port, username, enc_path, key):
+    """Checks the .enc file locally, sends it to the server, returns plaintext."""
+    path = require_enc(enc_path)
+    size = check_size(path, MAX_PAYLOAD, "Encrypted file")
+    if size < MIN_ENC_SIZE:
+        raise ClientError("Not a valid encrypted file (too short)")
+    return request_decrypt(host, port, username, key, _read_bytes(path))
+
+
+def write_decrypted(plaintext, enc_path, out_dir):
+    """Save decrypted bytes as <out_dir>/<.dec name>. Returns the path."""
+    out_path = decrypted_output_path(enc_path, out_dir)
+    _write_bytes(out_path, plaintext)
+    return out_path
+
+
+def op_compute_hmac(src, key):
+    """Compute the course HMAC of src and write <src>.hmac and <src>.hmackey.
+    Returns (mac, hmac path, hmackey path)."""
+    if len(key) != KEY_LEN:
+        raise ValueError("key must be 32 bytes")
+    data = read_input_file(src, MAX_PAYLOAD, "File")
+    mac = custom_hmac(key, data)
+    hmac_path, hmackey_path = hmac_paths(src)
+    write_b64_file(hmac_path, mac)
+    write_b64_file(hmackey_path, key)
+    return mac, hmac_path, hmackey_path
+
+
+def op_verify(host, port, username, path, key, mac):
+    """Checks the file locally, sends it to the server. True = VERIFIED."""
+    data = read_input_file(path, MAX_PAYLOAD, "File")
+    return request_verify(host, port, username, key, mac, data)

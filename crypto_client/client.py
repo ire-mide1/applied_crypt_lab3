@@ -1,11 +1,13 @@
-# Crypto server client. This stage: constants, exceptions, framing, AES-GCM,
-# course HMAC and base64/key helpers. No networking calls, no GUI yet.
+# Crypto server client. So far: constants, exceptions, framing, AES-GCM,
+# course HMAC, base64/key helpers and the three network requests.
+# No GUI and no file-name helpers yet.
 
 import base64
 import binascii
 import json
 import os
 import re
+import socket
 import struct
 
 from cryptography.exceptions import InvalidTag
@@ -157,3 +159,79 @@ def decode_key_text(text, what):
         raise ClientError(
             "%s does not decode to exactly 32 bytes (got %d)." % (what, len(raw)))
     return raw
+
+
+# ------------------------------------------------------------------ network
+def _clean_detail(detail):
+    """Server error text made safe to show: printable characters, max 200."""
+    if not isinstance(detail, str):
+        return ""
+    return "".join(ch for ch in detail if ch.isprintable())[:200]
+
+
+def exchange(host, port, msg_type, username, extra, payload, expect):
+    """One request on one connection. Returns (reply header, reply payload).
+
+    Raises ServerError for an "error" reply and ClientError for anything else
+    that goes wrong, including a reply whose type is not `expect`.
+    """
+    message = build_message(msg_type, username, extra, payload)
+    try:
+        with socket.create_connection((host, port), timeout=TIMEOUT) as sock:
+            sock.sendall(message)
+            header, data = read_message(sock)
+    except socket.timeout:
+        raise ClientError("Timed out waiting for the server.") from None
+    except socket.gaierror:
+        raise ClientError("Could not look up the server name.") from None
+    except ConnectionRefusedError:
+        raise ClientError("Connection refused by the server address.") from None
+    except ConnectionError:
+        raise ClientError("Connection was reset.") from None
+    except OSError as exc:
+        raise ClientError("Network error: %s" % (exc.strerror or type(exc).__name__)) from None
+    reply_type = header.get("type")
+    if reply_type == "error":
+        raise ServerError(_clean_detail(header.get("detail")))
+    if reply_type != expect:
+        raise ClientError(UNEXPECTED_REPLY)
+    return header, data
+
+
+def request_get_key(host, port, username):
+    """Send get_key. Returns the new 32-byte key, or raises."""
+    header, _ = exchange(host, port, "get_key", username, None, b"", "key_result")
+    try:
+        return decode_key_text(header.get("key"), "Server key")
+    except (ClientError, AttributeError):
+        raise ClientError("Server sent an invalid key") from None
+
+
+def request_decrypt(host, port, username, key, blob):
+    """Send decrypt with the encrypted file bytes. Returns the plaintext."""
+    if len(key) != KEY_LEN:
+        raise ValueError("key must be 32 bytes")
+    if len(blob) < MIN_ENC_SIZE:
+        raise ClientError("Not a valid encrypted file (too short)")
+    if len(blob) > MAX_PAYLOAD:
+        raise ClientError("Encrypted file is larger than %d bytes." % MAX_PAYLOAD)
+    _, data = exchange(host, port, "decrypt", username,
+                       {"key": encode_b64(key)}, blob, "decrypt_result")
+    return data
+
+
+def request_verify(host, port, username, key, mac, data):
+    """Send verify_hmac. Returns True for VERIFIED, False for FAILED."""
+    if len(key) != KEY_LEN or len(mac) != KEY_LEN:
+        raise ValueError("key and hmac must be 32 bytes")
+    if len(data) > MAX_PAYLOAD:
+        raise ClientError("File is larger than %d bytes." % MAX_PAYLOAD)
+    header, _ = exchange(host, port, "verify_hmac", username,
+                         {"key": encode_b64(key), "hmac": encode_b64(mac)},
+                         data, "verify_result")
+    result = header.get("result")
+    if result == "VERIFIED":
+        return True
+    if result == "FAILED":
+        return False
+    raise ClientError(UNEXPECTED_REPLY)

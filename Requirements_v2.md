@@ -13,7 +13,7 @@ The program is a desktop client with a simple GUI. It lets the user:
 •	Use only the standard library for everything else (socket, struct, json, base64, os, threading, pathlib, tkinter).
 •	Do not use Python's hmac module or cryptography.hazmat.primitives.hmac anywhere.
 •	Keep the app in one file, client.py, and keep the code simple. "One file" means one file for the app, not one function. Put a short comment at the top of each block (each function and each main section of the file), not on every line.
-•	client.py has GUI-free functions for framing, AES, HMAC and the network calls, and an if __name__ == "__main__": guard, so test_vectors.py and fake_server.py can import it without opening a window.
+•	client.py has GUI-free functions for framing, AES, HMAC and the network calls, and an if __name__ == "__main__": guard, so test_vectors.py can import it without opening a window.
 •	The encrypt function takes an optional nonce parameter, used only by test_vectors.py. The GUI never passes it, so real files always get a fresh random nonce.
 3. Connection settings
 •	The user types the server host, the port (default 8080), and their username into the window. The host field accepts any hostname or IP address and only has to be non-empty.
@@ -103,13 +103,12 @@ Build and test in this order. Do not move to the next step until the one before 
 1.	Message framing and the receive loop, tested against the framing vector in specification section 9.
 2.	AES-GCM encrypt, tested against the AES vector in section 9, before any networking.
 3.	The HMAC function, tested against both HMAC vectors in section 9 (hello world and the empty file). It must not produce 411b9a51..., which is the standard HMAC answer.
-4.	fake_server.py: a minimal local server for testing only. It implements framing, get_key, decrypt and verify_hmac. It is written after steps 1 to 3 and shares code with client.py, so it only proves the client agrees with it. The section 9 vectors remain the real check.
-5.	The network functions in client.py, tested against fake_server.py.
-6.	The GUI, built last, after test_vectors.py passes and the functions work against the fake server.
-7.	Real-server checks, run by the user (the assistant has no access to the server, IP or username), who reports the results back. "Do not move on until it passes" applies when the user reports:
+4.	The network functions in client.py.
+5.	Real-server checks, run by the user (the assistant has no access to the server, IP or username), who reports the results back. "Do not move on until it passes" applies when the user reports:
 a.	get_key against the real server.
 b.	Encrypt a file, decrypt it through the server, and compare the result byte for byte with the original.
 c.	verify_hmac against the server: VERIFIED for the correct file, then FAILED after changing one byte of the file.
+6.	The GUI, built last, after test_vectors.py passes and the functions work against the real server.
 Write the tests for steps 1, 2 and 3 as a small separate script, test_vectors.py. Use plain asserts and print a PASS line for each check. Check:
 •	the framing hex
 •	AES encrypt against the vector (with the fixed nonce), plus decrypting that vector locally

@@ -8,14 +8,13 @@ Based on `crypto_message_spec_v2.md` (wire format, algorithms) and `Requirements
 |---|---|
 | `client.py` | The whole app: constants, framing, crypto, validation, file-name helpers, GUI-free operations, and the Tkinter GUI. Importing it must not open a window; the GUI starts only under `if __name__ == "__main__":`. |
 | `test_vectors.py` | Plain-assert checks of the spec section 9 vectors. Covers framing, AES (with a fixed nonce, plus a local decrypt of the vector), Ki, Ko, inner hash, both HMAC vectors, and "not the standard HMAC value". Prints a PASS line per check. No network. |
-| `fake_server.py` | Local test server on 127.0.0.1. It imports framing and `custom_hmac` from `client.py`. It implements `get_key`, `decrypt` and `verify_hmac` and replies with `error` for anything malformed. It is only for testing the client, so it proves agreement with itself, not correctness. |
 | `Results/` | Test files, their `.enc/.key/.dec/.hmac/.hmackey` outputs, `hello_modified.txt`, and three screenshots. |
 | `.gitignore` | `__pycache__/` and `*.pyc` only. |
 | `Requirements_v2.md`, `crypto_message_spec_v2.md`, `design_v1.md` | Documents. |
 
 ## 2. `client.py` structure
 
-The file is a sequence of blocks, each with a short comment. Everything above the GUI block is plain functions that tests and the fake server can import.
+The file is a sequence of blocks, each with a short comment. Everything above the GUI block is plain functions that tests can import.
 
 ### 2.1 Constants
 
@@ -193,14 +192,10 @@ The program never exits on an error. Busy state is always cleared in a `finally`
 | Framing | `build_message` against the section 9 hex; `read_message` on built messages through a socket pair | `test_vectors.py` |
 | AES | `encrypt_bytes` with the fixed nonce; local decrypt of the vector | `test_vectors.py` |
 | HMAC | Ki, Ko, inner hash, both HMAC vectors, not `411b9a51…` | `test_vectors.py` |
-| Operations | All five `op_*` functions and error paths | `fake_server.py` on 127.0.0.1 |
 | Real server | `get_key`, decrypt round trip, VERIFIED then FAILED | You run these and report back |
-
-`fake_server.py` serves each connection in its own thread, reuses `client.py` framing and `custom_hmac`, and rejects malformed requests with a generic `error`. To exercise the error paths without the real server, it treats the username `baduser` as unknown (replying `error`) and the username `slowuser` as one that never replies (for the timeout path). These test-only usernames are my proposal.
 
 ## 8. Decisions made here
 
 - **Decrypt prompts up front.** I ask for the output folder and the overwrite confirmation before sending the request, so a cancel costs nothing and the rest runs without interaction. The alternative is to ask after the reply arrives.
 - **Error detail is shown but capped.** The server's `detail` is shown as the requirements say, truncated to 200 characters with control characters removed.
 - **Catch-all shows only the class name.** This satisfies "no exception text" for keys, at the cost of a less helpful message for bugs.
-- **Fake-server usernames.** `baduser` and `slowuser` are my proposal for testing error and timeout paths.
